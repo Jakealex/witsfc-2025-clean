@@ -5,5 +5,5 @@ host=${1:-localhost}
 port=${2:-3100}
 
 for i in {1..5}; do
-  python3 ./Run_Player.py -i $host -p $port -u $i -t StudentName -P 0 -D 1 &
+  python3 ./Run_Player.py -i $host -p $port -u $i -t 2551264 -P 0 -D 1 &
 done
