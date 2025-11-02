@@ -8,13 +8,35 @@ class Strategy():
         self.world = world
         self.play_mode = world.play_mode
         self.robot_model = world.robot
+
+        self.PM_GROUP = getattr(world, 'pm_group', None)
+        if self.PM_GROUP is None:
+            self.PM_GROUP = getattr(world, 'play_mode_group', None)
+        if self.PM_GROUP is None:
+            mg_active = getattr(world, 'MG_ACTIVE_BEAM', None)
+            mg_passive = getattr(world, 'MG_PASSIVE_BEAM', None)
+            try:
+                if self.play_mode == getattr(world, 'M_BEFORE_KICKOFF', None) and mg_passive is not None:
+                    self.PM_GROUP = mg_passive
+                else:
+                    self.PM_GROUP = mg_active if mg_active is not None else mg_passive
+            except Exception:
+                self.PM_GROUP = None
         
+        # ===== SAFE INITIALIZATION WITH HELPER =====
+        # ...existing code...
         # ===== SAFE INITIALIZATION WITH HELPER =====
         def safe_pos_2d(obj, attr='loc_head_position', default=(0.0, 0.0)):
             """Extract 2D position safely, return numpy array."""
             try:
-                val = getattr(obj, attr) if obj else None
-                if val is not None and len(val) >= 2:
+                # Avoid using obj in boolean context since obj may contain numpy arrays
+                if obj is None:
+                    return np.array(default, dtype=np.float64)
+                val = getattr(obj, attr, None)
+                if val is None:
+                    return np.array(default, dtype=np.float64)
+                # Ensure we have at least two elements
+                if len(val) >= 2:
                     return np.asarray(val[:2], dtype=np.float64)
             except (AttributeError, TypeError, IndexError):
                 pass
@@ -41,10 +63,17 @@ class Strategy():
             """Safely extract list of numpy 2D positions from player list."""
             if players is None:
                 return [None] * 5
-            return [
-                safe_pos_2d(p, 'state_abs_pos') if p and p.state_abs_pos else None
-                for p in players
-            ]
+            positions = []
+            for p in players:
+                if p is None:
+                    positions.append(None)
+                    continue
+                state = getattr(p, 'state_abs_pos', None)
+                if state is None:
+                    positions.append(None)
+                else:
+                    positions.append(safe_pos_2d(p, 'state_abs_pos'))
+            return positions
         
         self.teammate_positions = extract_positions(world.teammates)
         self.opponent_positions = extract_positions(world.opponents)
@@ -62,36 +91,31 @@ class Strategy():
         self.my_ori = float(self.robot_model.imu_torso_orientation or 0.0)
         
         # Ball state - direct access since ball_abs_pos is not an object attribute
-        try:
-            if world.ball_abs_pos is not None:
-                self.ball_2d = np.asarray(world.ball_abs_pos[:2], dtype=np.float64)
-            else:
-                self.ball_2d = np.array([0.0, 0.0], dtype=np.float64)
-        except (TypeError, IndexError):
+
+        # ...existing code...
+        # Ball state - direct access since ball_abs_pos is not an object attribute
+        # Safely extract 2D ball position, a smoothed/alias position (slow_ball_pos),
+        # and a ball-facing direction for use elsewhere in the strategy.
+        ball_raw = getattr(world, 'ball_abs_pos', None)
+        if ball_raw is None:
             self.ball_2d = np.array([0.0, 0.0], dtype=np.float64)
-        
-        self.ball_vec = self.ball_2d - self.my_head_pos_2d
-        self.ball_dir = M.vector_angle(self.ball_vec)
-        self.ball_dist = np.linalg.norm(self.ball_vec)
-        self.ball_sq_dist = self.ball_dist ** 2
-        
-        # Ball velocity
+        else:
+            try:
+                self.ball_2d = np.asarray(ball_raw[:2], dtype=np.float64)
+            except Exception:
+                self.ball_2d = np.array([0.0, 0.0], dtype=np.float64)
+
+        # slow_ball_pos is used for distance checks — use current ball if no smoother is available
+        self.slow_ball_pos = self.ball_2d.copy()
+
+        # ball_dir: angle (degrees) pointing from my head toward the ball (safe fallback = 0.0)
         try:
-            ball_vel = world.get_ball_abs_vel(6)
-            self.ball_speed = np.linalg.norm(ball_vel[:2]) if ball_vel else 0.0
-        except (TypeError, IndexError):
-            self.ball_speed = 0.0
-        
-        self.goal_dir = M.target_abs_angle(self.ball_2d, (15.05, 0))
-        self.PM_GROUP = world.play_mode_group
-        
-        # Predicted ball position
-        try:
-            pred = world.get_predicted_ball_pos(0.5)
-            self.slow_ball_pos = np.asarray(pred[:2], dtype=np.float64) if pred else self.ball_2d.copy()
-        except (TypeError, IndexError):
-            self.slow_ball_pos = self.ball_2d.copy()
-        
+            ball_vec = self.ball_2d - self.my_head_pos_2d
+            self.ball_dir = float(M.vector_angle(ball_vec))
+        except Exception:
+            self.ball_dir = 0.0
+# ...existing code...
+# ...existing code...
         # ===== DISTANCE CALCULATIONS =====
         def compute_ball_distances(players):
             """Compute squared distances from players to slow_ball_pos."""
@@ -100,17 +124,28 @@ class Strategy():
             
             distances = []
             for p in players:
-                if (p and p.state_abs_pos and p.state_last_update != 0 and
-                    (world.time_local_ms - p.state_last_update <= 360 or getattr(p, 'is_self', False)) and
-                    not getattr(p, 'state_fallen', False)):
+                if p is None:
+                    distances.append(1000.0)
+                    continue
+                state_pos = getattr(p, 'state_abs_pos', None)
+                last_update = getattr(p, 'state_last_update', 0)
+                fallen = getattr(p, 'state_fallen', False)
+                is_self = getattr(p, 'is_self', False)
+                
+                valid = (state_pos is not None and last_update != 0 and
+                         (world.time_local_ms - last_update <= 360 or is_self) and
+                         not fallen)
+                
+                if valid:
                     pos = safe_pos_2d(p, 'state_abs_pos')
-                    distances.append(np.sum((pos - self.slow_ball_pos) ** 2))
+                    distances.append(float(np.sum((pos - self.slow_ball_pos) ** 2)))
                 else:
                     distances.append(1000.0)
             return distances
         
         self.teammates_ball_sq_dist = compute_ball_distances(world.teammates)
         self.opponents_ball_sq_dist = compute_ball_distances(world.opponents)
+# ...existing code...
         
         # Minimum distances and active player
         if self.teammates_ball_sq_dist:
